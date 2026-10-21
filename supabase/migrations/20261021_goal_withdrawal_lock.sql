@@ -54,12 +54,8 @@ BEGIN
 END;
 $$;
 
--- Keep the existing trigger name so this replaces its function safely.
-DROP TRIGGER IF EXISTS validate_sama_nafa_transaction_goal ON public.transactions;
-CREATE TRIGGER validate_sama_nafa_transaction_goal
-BEFORE INSERT ON public.transactions
-FOR EACH ROW
-EXECUTE FUNCTION public.validate_sama_nafa_transaction_goal();
+-- The existing validate_sama_nafa_transaction_goal trigger already calls this
+-- function, so replacing the function above updates its behavior safely.
 
 -- While a lock is active, it cannot be removed or shortened.
 CREATE OR REPLACE FUNCTION public.protect_sama_nafa_goal_lock()
@@ -82,7 +78,6 @@ BEGIN
 END;
 $$;
 
-DROP TRIGGER IF EXISTS protect_sama_nafa_goal_lock ON public.savings_goals;
 CREATE TRIGGER protect_sama_nafa_goal_lock
 BEFORE INSERT OR UPDATE OF locked_until ON public.savings_goals
 FOR EACH ROW
