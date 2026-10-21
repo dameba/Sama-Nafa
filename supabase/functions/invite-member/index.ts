@@ -3,8 +3,11 @@
 // The caller must be an authenticated active Sama Nafa administrator.
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
+// Set ALLOWED_ORIGIN to the exact deployed app origin, e.g. https://your-app.vercel.app.
+const allowedOrigin = Deno.env.get("ALLOWED_ORIGIN") ?? "";
 const corsHeaders = {
-  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Origin": allowedOrigin,
+  "Vary": "Origin",
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
 };
@@ -17,7 +20,14 @@ function reply(body: unknown, status = 200) {
 }
 
 Deno.serve(async (req: Request) => {
-  if (req.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
+  const origin = req.headers.get("Origin");
+  if (origin && (!allowedOrigin || origin !== allowedOrigin)) {
+    return new Response("Origin not allowed.", { status: 403 });
+  }
+  if (req.method === "OPTIONS") {
+    if (!allowedOrigin) return new Response("Server CORS configuration is incomplete.", { status: 500 });
+    return new Response("ok", { headers: corsHeaders });
+  }
   if (req.method !== "POST") return reply({ error: "Method not allowed." }, 405);
 
   const authorization = req.headers.get("Authorization");
