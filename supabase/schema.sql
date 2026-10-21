@@ -1,5 +1,5 @@
--- Sama Nafa secure multi-member foundation
--- Run this in the Supabase SQL Editor before connecting the app.
+-- Sama Nafa security-hardened multi-member foundation
+-- Review and run in the Supabase SQL Editor before connecting the app.
 create extension if not exists pgcrypto;
 
 create table if not exists public.profiles (
@@ -33,38 +33,45 @@ create table if not exists public.savings_goals (
 create index if not exists transactions_member_date_idx on public.transactions(member_id, occurred_on desc);
 create index if not exists goals_member_idx on public.savings_goals(member_id);
 
--- Security-definer helper prevents recursive profile policies.
 create or replace function public.is_sama_nafa_admin()
 returns boolean
-language sql
-stable
-security definer
+language sql stable security definer
 set search_path = ''
 as $$
   select exists (
     select 1 from public.profiles p
     where p.id = (select auth.uid())
-      and p.role = 'admin'
-      and p.status = 'active'
+      and p.role = 'admin' and p.status = 'active'
   );
 $$;
 revoke all on function public.is_sama_nafa_admin() from public;
 grant execute on function public.is_sama_nafa_admin() to authenticated;
 
--- New invited accounts automatically get member role; never accept a role from metadata.
+create or replace function public.is_sama_nafa_active_member()
+returns boolean
+language sql stable security definer
+set search_path = ''
+as $$
+  select exists (
+    select 1 from public.profiles p
+    where p.id = (select auth.uid())
+      and p.status = 'active'
+  );
+$$;
+revoke all on function public.is_sama_nafa_active_member() from public;
+grant execute on function public.is_sama_nafa_active_member() to authenticated;
+
 create or replace function public.handle_new_sama_nafa_user()
 returns trigger
-language plpgsql
-security definer
+language plpgsql security definer
 set search_path = ''
 as $$
 begin
   insert into public.profiles (id, display_name, role, status)
   values (
     new.id,
-    coalesce(nullif(trim(new.raw_user_meta_data ->> 'display_name'), ''), 'Member'),
-    'member',
-    'active'
+    coalesce(nullif(pg_catalog.btrim(new.raw_user_meta_data ->> 'display_name'), ''), 'Member'),
+    'member', 'active'
   )
   on conflict (id) do nothing;
   return new;
@@ -80,7 +87,6 @@ alter table public.profiles enable row level security;
 alter table public.transactions enable row level security;
 alter table public.savings_goals enable row level security;
 
--- Remove broad defaults, then grant only the client operations needed.
 revoke all on public.profiles from anon, authenticated;
 revoke all on public.transactions from anon, authenticated;
 revoke all on public.savings_goals from anon, authenticated;
@@ -104,9 +110,7 @@ drop policy if exists "transactions_self_or_admin_read" on public.transactions;
 create policy "transactions_self_or_admin_read" on public.transactions
 for select to authenticated
 using (
-  (member_id = (select auth.uid()) and exists (
-    select 1 from public.profiles p where p.id = (select auth.uid()) and p.status = 'active'
-  ))
+  (member_id = (select auth.uid()) and (select public.is_sama_nafa_active_member()))
   or (select public.is_sama_nafa_admin())
 );
 
@@ -115,44 +119,111 @@ create policy "transactions_self_or_admin_insert" on public.transactions
 for insert to authenticated
 with check (
   created_by = (select auth.uid())
+  and (select public.is_sama_nafa_active_member())
   and (
-    (member_id = (select auth.uid()) and exists (
-      select 1 from public.profiles p where p.id = (select auth.uid()) and p.status = 'active'
-    ))
+    member_id = (select auth.uid())
     or (select public.is_sama_nafa_admin())
   )
 );
 
--- Transactions are append-only for members; use an auditable correction workflow for adjustments.
--- No client UPDATE or DELETE grants are given to authenticated users.
-
 drop policy if exists "goals_self_or_admin_read" on public.savings_goals;
 create policy "goals_self_or_admin_read" on public.savings_goals
 for select to authenticated
-using (member_id = (select auth.uid()) or (select public.is_sama_nafa_admin()));
+using (
+  (member_id = (select auth.uid()) and (select public.is_sama_nafa_active_member()))
+  or (select public.is_sama_nafa_admin())
+);
 
 drop policy if exists "goals_self_insert" on public.savings_goals;
 create policy "goals_self_insert" on public.savings_goals
 for insert to authenticated
 with check (
   member_id = (select auth.uid())
-  and exists (select 1 from public.profiles p where p.id = (select auth.uid()) and p.status = 'active')
+  and (select public.is_sama_nafa_active_member())
 );
 
 drop policy if exists "goals_self_update" on public.savings_goals;
 create policy "goals_self_update" on public.savings_goals
 for update to authenticated
-using (member_id = (select auth.uid()))
-with check (member_id = (select auth.uid()));
+using (member_id = (select auth.uid()) and (select public.is_sama_nafa_active_member()))
+with check (member_id = (select auth.uid()) and (select public.is_sama_nafa_active_member()));
 
 drop policy if exists "goals_self_delete" on public.savings_goals;
 create policy "goals_self_delete" on public.savings_goals
 for delete to authenticated
-using (member_id = (select auth.uid()));
+using (member_id = (select auth.uid()) and (select public.is_sama_nafa_active_member()));
 
--- Initial admin setup:
--- 1. Create your own user in Supabase Auth.
--- 2. Run the following separately, replacing the email with the exact admin email:
+-- Database-side transaction validation prevents API clients bypassing browser checks.
+-- Lock the profile row so two concurrent withdrawals for one member serialize.
+create or replace function public.validate_sama_nafa_transaction()
+returns trigger
+language plpgsql security definer
+set search_path = ''
+as $$
+declare
+  member_status text;
+  current_balance numeric;
+begin
+  select p.status into member_status
+  from public.profiles p
+  where p.id = new.member_id
+  for update;
+
+  if member_status is distinct from 'active' then
+    raise exception 'This member account is not active.';
+  end if;
+
+  if new.created_by is distinct from (select auth.uid()) then
+    raise exception 'created_by must match the signed-in user.';
+  end if;
+
+  select coalesce(sum(case when t.kind = 'deposit' then t.amount_xof else -t.amount_xof end), 0)
+  into current_balance
+  from public.transactions t
+  where t.member_id = new.member_id;
+
+  if new.kind = 'withdrawal' and new.amount_xof > current_balance then
+    raise exception 'Withdrawal exceeds the recorded savings balance.';
+  end if;
+
+  return new;
+end;
+$$;
+
+drop trigger if exists validate_sama_nafa_transaction_before_insert on public.transactions;
+create trigger validate_sama_nafa_transaction_before_insert
+before insert on public.transactions
+for each row execute function public.validate_sama_nafa_transaction();
+
+-- Admin-only status management. Members cannot promote themselves or change status directly.
+create or replace function public.set_sama_nafa_member_status(target_member_id uuid, new_status text)
+returns void
+language plpgsql security definer
+set search_path = ''
+as $$
+begin
+  if not (select public.is_sama_nafa_admin()) then
+    raise exception 'Only an active administrator can change member status.';
+  end if;
+  if new_status not in ('active', 'suspended') then
+    raise exception 'Status must be active or suspended.';
+  end if;
+  if target_member_id = (select auth.uid()) then
+    raise exception 'Administrators cannot change their own status here.';
+  end if;
+  update public.profiles
+  set status = new_status
+  where id = target_member_id and role = 'member';
+  if not found then
+    raise exception 'Member account not found.';
+  end if;
+end;
+$$;
+revoke all on function public.set_sama_nafa_member_status(uuid, text) from public;
+grant execute on function public.set_sama_nafa_member_status(uuid, text) to authenticated;
+
+-- Transactions are append-only: no client UPDATE or DELETE grants.
+-- First admin setup must be performed manually after creating the admin's Auth user:
 -- update public.profiles p set role = 'admin'
 -- from auth.users u where p.id = u.id and u.email = 'YOUR_ADMIN_EMAIL';
--- Never let a public signup or client request set role='admin'.
+-- Never set admin role from client input or user metadata.
