@@ -1,0 +1,25 @@
+{
+  "id": "/",
+  "name": "Sama Nafa — Savings Tracker",
+  "short_name": "Sama Nafa",
+  "description": "Track your savings, deposits, and financial goals with Sama Nafa.",
+  "lang": "wo",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "background_color": "#061329",
+  "theme_color": "#07152e",
+  "icons": [
+    {
+      "src": "/icons/sama-nafa.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ],
+  "categories": [
+    "finance",
+    "utilities"
+  ]
+}
