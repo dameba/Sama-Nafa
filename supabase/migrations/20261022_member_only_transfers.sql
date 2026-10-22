@@ -35,7 +35,6 @@ FOR SELECT TO authenticated
 USING (
   sender_id = (SELECT auth.uid())
   OR recipient_id = (SELECT auth.uid())
-  OR (SELECT public.is_sama_nafa_admin())
 );
 
 CREATE OR REPLACE FUNCTION public.create_sama_nafa_member_transfer(
